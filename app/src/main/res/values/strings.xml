@@ -1,0 +1,30 @@
+<resources>
+    <string name="app_name">Discoursey</string>
+    <string name="login_title">Connect to Discourse</string>
+    <string name="login_subtitle">Enter your Discourse community URL and credentials to begin.</string>
+    <string name="forum_url_label">Discourse Instance URL</string>
+    <string name="forum_url_hint">https://meta.discourse.org</string>
+    <string name="username_label">Username or Email</string>
+    <string name="password_label">Password</string>
+    <string name="connect_button">Connect to Forum</string>
+    <string name="use_demo_button">Try Public Demo Instance</string>
+    <string name="invalid_url_error">Please enter a valid Discourse URL</string>
+    <string name="topics_title">Topics</string>
+    <string name="search_hint">Type to filter</string>
+    <string name="home_tab">Home</string>
+    <string name="search_tab">Search</string>
+    <string name="messages_tab">Messages</string>
+    <string name="profile_tab">Profile</string>
+    <string name="menu_tab">Menu</string>
+    <string name="settings_title">Settings</string>
+    <string name="private_messages">Private Messages</string>
+    <string name="notifications">Notifications</string>
+    <string name="mark_all_read">Mark all as read</string>
+    <string name="new_topic">New Topic</string>
+    <string name="reply_topic">Reply</string>
+    <string name="classic_ui_mode">Classic Clean UI</string>
+    <string name="modern_ui_mode">Modern Flow UI</string>
+    <string name="clear_cache">Clear Cache</string>
+    <string name="cache_cleared">Cache cleared successfully</string>
+    <string name="albums_title">Photos &amp; Albums</string>
+</resources>
