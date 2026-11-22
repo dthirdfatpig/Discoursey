@@ -32,7 +32,7 @@ fun MarkdownText(
     baseUrl: String = ""
 ) {
     // Check for Discourse Video Stream BBCode tag: [video-stream id="..."]
-    val hasVideoStream = htmlContent.contains("[video-stream")
+    val hasVideoStream = htmlContent.contains("[video-stream", ignoreCase = true)
 
     // Extract image URLs from HTML <img> tags or Discourse upload markup
     val imageUrls = remember(htmlContent) {
@@ -50,45 +50,61 @@ fun MarkdownText(
                 list.add(src)
             }
         }
-        list
+        list.distinct()
+    }
+
+    // Clean HTML for the TextView by stripping out image metadata, filenames, poll wrappers, and video tags
+    val cleanedHtml = remember(htmlContent) {
+        htmlContent
+            // Strip lightbox metadata that displays file names & image dimensions
+            .replace(Regex("""<div class=["']meta["'][\s\S]*?</div>""", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("""<span class=["']filename["'][\s\S]*?</span>""", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("""<span class=["']informations["'][\s\S]*?</span>""", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("""<svg[\s\S]*?</svg>""", RegexOption.IGNORE_CASE), "")
+            // Strip polls from raw text since they are rendered as native interactive Compose poll widgets
+            .replace(Regex("""<div class=["']poll["'][\s\S]*?</div>""", RegexOption.IGNORE_CASE), "")
+            // Strip video stream markup from text view
+            .replace(Regex("""\[video-stream[^\]]*\][\s\S]*?\[/video-stream\]""", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("""\[video-stream[^\]]*\]""", RegexOption.IGNORE_CASE), "")
+            // Remove <img> tags since they are rendered natively with Coil below
+            .replace(Regex("""<img[^>]+>""", RegexOption.IGNORE_CASE), "")
+            .trim()
     }
 
     Column(modifier = modifier) {
-        AndroidView(
-            modifier = Modifier.fillMaxWidth(),
-            factory = { context ->
-                TextView(context).apply {
-                    setTextColor(textColor.toArgb())
-                    textSize = 15f
-                    setLineSpacing(6f, 1.15f)
-                    linksClickable = true
+        if (cleanedHtml.isNotBlank()) {
+            AndroidView(
+                modifier = Modifier.fillMaxWidth(),
+                factory = { context ->
+                    TextView(context).apply {
+                        setTextColor(textColor.toArgb())
+                        textSize = 15f
+                        setLineSpacing(6f, 1.15f)
+                        linksClickable = true
+                    }
+                },
+                update = { textView ->
+                    val spanned = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                        Html.fromHtml(cleanedHtml, Html.FROM_HTML_MODE_COMPACT)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        Html.fromHtml(cleanedHtml)
+                    }
+                    textView.text = spanned
                 }
-            },
-            update = { textView ->
-                val cleanedHtml = htmlContent
-                    .replace(Regex("\\[video-stream[^\\]]*\\]"), "")
-                    // Remove <img> tags from text view since they are rendered natively with Coil below
-                    .replace(Regex("""<img[^>]+>"""), "")
-                val spanned = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                    Html.fromHtml(cleanedHtml, Html.FROM_HTML_MODE_COMPACT)
-                } else {
-                    @Suppress("DEPRECATION")
-                    Html.fromHtml(cleanedHtml)
-                }
-                textView.text = spanned
-            }
-        )
+            )
+        }
 
-        // Render images attached in post
+        // Render images attached in post without file names
         if (imageUrls.isNotEmpty()) {
             Spacer(modifier = Modifier.height(10.dp))
             imageUrls.forEach { imgUrl ->
                 AsyncImage(
                     model = imgUrl,
-                    contentDescription = "Post image",
+                    contentDescription = null,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .heightIn(max = 320.dp)
+                        .heightIn(max = 340.dp)
                         .clip(RoundedCornerShape(8.dp)),
                     contentScale = ContentScale.Fit
                 )

@@ -71,6 +71,32 @@ interface DiscourseApi {
         @Path("reaction") reaction: String
     ): Response<ResponseBody>
 
+    @PUT("polls/vote.json")
+    @FormUrlEncoded
+    suspend fun votePoll(
+        @Field("post_id") postId: Long,
+        @Field("poll_name") pollName: String,
+        @Field("options[]") options: List<String>
+    ): Response<ResponseBody>
+
+    @DELETE("polls/vote.json")
+    suspend fun unvotePoll(
+        @Query("post_id") postId: Long,
+        @Query("poll_name") pollName: String
+    ): Response<ResponseBody>
+
+    @POST("voting/vote.json")
+    @FormUrlEncoded
+    suspend fun voteTopic(
+        @Field("topic_id") topicId: Long
+    ): Response<ResponseBody>
+
+    @POST("voting/unvote.json")
+    @FormUrlEncoded
+    suspend fun unvoteTopic(
+        @Field("topic_id") topicId: Long
+    ): Response<ResponseBody>
+
     @POST("posts.json")
     suspend fun createPost(
         @Body request: CreatePostRequest

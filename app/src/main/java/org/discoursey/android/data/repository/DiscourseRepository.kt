@@ -256,24 +256,64 @@ class DiscourseRepository(
 
     suspend fun toggleReaction(postId: Long, reactionName: String): Result<Boolean> = withContext(Dispatchers.IO) {
         try {
-            val response = client.api.toggleCustomReaction(postId, reactionName)
-            if (response.isSuccessful) {
-                Result.success(true)
-            } else {
-                // If custom reaction endpoint returns 404/not supported, fallback to like
-                if (reactionName == "heart") {
+            if (reactionName == "heart") {
+                val resp = client.api.toggleCustomReaction(postId, "heart")
+                if (resp.isSuccessful) {
+                    Result.success(true)
+                } else {
+                    // Fallback to core like
                     toggleLike(postId, false)
+                }
+            } else {
+                val response = client.api.toggleCustomReaction(postId, reactionName)
+                if (response.isSuccessful) {
+                    Result.success(true)
                 } else {
                     Result.failure(Exception("Reactions not supported on this forum."))
                 }
             }
         } catch (_: Exception) {
-            // Fallback for heart
             if (reactionName == "heart") {
                 toggleLike(postId, false)
             } else {
                 Result.failure(Exception("Reactions not enabled on this forum."))
             }
+        }
+    }
+
+    suspend fun votePoll(postId: Long, pollName: String, options: List<String>): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val resp = client.api.votePoll(postId, pollName, options)
+            resp.isSuccessful
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    suspend fun unvotePoll(postId: Long, pollName: String): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val resp = client.api.unvotePoll(postId, pollName)
+            resp.isSuccessful
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    suspend fun voteTopic(topicId: Long): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val resp = client.api.voteTopic(topicId)
+            resp.isSuccessful
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    suspend fun unvoteTopic(topicId: Long): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val resp = client.api.unvoteTopic(topicId)
+            resp.isSuccessful
+        } catch (_: Exception) {
+            false
         }
     }
 
@@ -390,16 +430,112 @@ class DiscourseRepository(
         }
     }
 
-    // Discourse Video Stream Plugin Upload (/video-stream/prepare-upload)
-    suspend fun prepareVideoStream(fileName: String, fileSize: Long, mimeType: String): Result<PrepareVideoUploadResponse> =
-        withContext(Dispatchers.IO) {
+    // Video Upload: Supports discourse-video-stream plugin (Cloudflare/Bunny TUS) and Discourse internal video upload
+    suspend fun uploadVideoStream(context: Context, uri: Uri): Result<String> = withContext(Dispatchers.IO) {
+        val contentResolver = context.contentResolver
+        val fileName = getFileName(context, uri) ?: "video_${System.currentTimeMillis()}.mp4"
+        val mimeType = contentResolver.getType(uri) ?: "video/mp4"
+
+        val tempFile = File(context.cacheDir, "temp_stream_$fileName")
+        try {
+            contentResolver.openInputStream(uri)?.use { input ->
+                FileOutputStream(tempFile).use { output ->
+                    input.copyTo(output)
+                }
+            }
+            val fileSize = tempFile.length()
+
+            // 1. Try Discourse Video Stream plugin via Cloudflare TUS route (/video-stream/upload-url)
+            val baseUri = client.currentBaseUrl.trimEnd('/')
+            val metaString = "name " + android.util.Base64.encodeToString(fileName.toByteArray(), android.util.Base64.NO_WRAP) +
+                    ",filetype " + android.util.Base64.encodeToString(mimeType.toByteArray(), android.util.Base64.NO_WRAP)
+
+            val cfInitRequest = okhttp3.Request.Builder()
+                .url("$baseUri/video-stream/upload-url")
+                .post("".toRequestBody("application/json".toMediaTypeOrNull()))
+                .header("Upload-Length", fileSize.toString())
+                .header("Upload-Metadata", metaString)
+                .header("Tus-Resumable", "1.0.0")
+                .header("Accept", "application/json")
+                .build()
+
+            val cfResp = client.okHttpClient.newCall(cfInitRequest).execute()
+            if (cfResp.code == 201 || cfResp.isSuccessful) {
+                val location = cfResp.header("Location")
+                val streamMediaId = cfResp.header("stream-media-id")
+                cfResp.close()
+
+                if (!location.isNullOrBlank()) {
+                    val fileBody = tempFile.asRequestBody("application/offset+octet-stream".toMediaTypeOrNull())
+                    val patchRequest = okhttp3.Request.Builder()
+                        .url(location)
+                        .patch(fileBody)
+                        .header("Tus-Resumable", "1.0.0")
+                        .header("Upload-Offset", "0")
+                        .header("Content-Type", "application/offset+octet-stream")
+                        .build()
+
+                    val patchResp = client.rawHttpClient.newCall(patchRequest).execute()
+                    patchResp.close()
+
+                    var uid = streamMediaId
+                    if (uid.isNullOrBlank()) {
+                        uid = location.substringAfterLast('/').substringBefore('?')
+                    }
+                    tempFile.delete()
+                    return@withContext Result.success("\n\n[video-stream id=\"$uid\"]\n[/video-stream]\n\n")
+                }
+            } else {
+                cfResp.close()
+            }
+
+            // 2. Try Bunny video stream provider (/video-stream/prepare-upload)
             try {
-                val resp = client.api.prepareVideoUpload(fileName, fileSize, mimeType)
-                Result.success(resp)
-            } catch (e: Exception) {
+                val prepareResp = client.api.prepareVideoUpload(fileName, fileSize, mimeType)
+                val endpoint = prepareResp.endpoint ?: prepareResp.uploadUrl
+                val vid = prepareResp.videoId ?: prepareResp.streamMediaId
+                if (!vid.isNullOrBlank() && !endpoint.isNullOrBlank()) {
+                    val fileBody = tempFile.asRequestBody("application/offset+octet-stream".toMediaTypeOrNull())
+                    val patchBuilder = okhttp3.Request.Builder()
+                        .url(endpoint)
+                        .patch(fileBody)
+                        .header("Tus-Resumable", "1.0.0")
+                        .header("Upload-Offset", "0")
+                        .header("Content-Type", "application/offset+octet-stream")
+
+                    for ((k, v) in prepareResp.headers) {
+                        patchBuilder.header(k, v)
+                    }
+                    val bunnyResp = client.rawHttpClient.newCall(patchBuilder.build()).execute()
+                    bunnyResp.close()
+                    tempFile.delete()
+                    return@withContext Result.success("\n\n[video-stream id=\"$vid\"]\n[/video-stream]\n\n")
+                }
+            } catch (_: Exception) { }
+
+            // 3. Fallback to standard Discourse internal video upload (/uploads.json)
+            val uploadResult = uploadFile(context, uri)
+            tempFile.delete()
+            if (uploadResult.isSuccess) {
+                val upload = uploadResult.getOrNull()!!
+                val targetUrl = upload.shortUrl?.takeIf { it.isNotBlank() } ?: upload.url
+                Result.success("\n<video controls src=\"$targetUrl\"></video>\n")
+            } else {
+                Result.failure(uploadResult.exceptionOrNull() ?: Exception("Video upload failed"))
+            }
+        } catch (e: Exception) {
+            tempFile.delete()
+            // Final fallback to standard upload
+            val uploadResult = uploadFile(context, uri)
+            if (uploadResult.isSuccess) {
+                val upload = uploadResult.getOrNull()!!
+                val targetUrl = upload.shortUrl?.takeIf { it.isNotBlank() } ?: upload.url
+                Result.success("\n<video controls src=\"$targetUrl\"></video>\n")
+            } else {
                 Result.failure(e)
             }
         }
+    }
 
     private fun getFileName(context: Context, uri: Uri): String? {
         var name: String? = null

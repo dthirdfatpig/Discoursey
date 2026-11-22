@@ -3,8 +3,10 @@ package org.discoursey.android.data.api
 import android.content.Context
 import android.content.SharedPreferences
 import com.google.gson.Gson
+import com.google.gson.JsonObject
 import com.google.gson.reflect.TypeToken
 import okhttp3.*
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
@@ -105,11 +107,17 @@ class DiscourseClient(private val context: Context) {
     }
 
     val cookieJar = PersistentCookieJar(context)
+    private val sessionPrefs = context.getSharedPreferences("discoursey_session", Context.MODE_PRIVATE)
 
     var currentBaseUrl: String = "https://meta.discourse.org/"
         private set
 
-    var csrfToken: String? = null
+    var csrfToken: String?
+        get() = sessionPrefs.getString("csrf_token", null)
+        set(value) {
+            sessionPrefs.edit().putString("csrf_token", value).apply()
+        }
+
     var userApiKey: String? = null
     var adminApiKey: String? = null
     var adminUsername: String? = null
@@ -119,19 +127,38 @@ class DiscourseClient(private val context: Context) {
         Cache(cacheDir, 50L * 1024L * 1024L) // 50MB
     }
 
+    // Bare client without CSRF interceptor, used for fetching CSRF token and external uploads
+    val rawHttpClient: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .cookieJar(cookieJar)
+            .connectTimeout(30, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
+            .writeTimeout(60, TimeUnit.SECONDS)
+            .build()
+    }
+
     val okHttpClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
             .cache(httpCache)
             .cookieJar(cookieJar)
-            .connectTimeout(20, TimeUnit.SECONDS)
-            .readTimeout(25, TimeUnit.SECONDS)
-            .writeTimeout(25, TimeUnit.SECONDS)
+            .connectTimeout(30, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
+            .writeTimeout(60, TimeUnit.SECONDS)
             .addInterceptor { chain ->
                 val original = chain.request()
+                val requestHost = original.url.host
+                val forumHost = currentBaseUrl.toHttpUrlOrNull()?.host ?: ""
+                val isDiscourseRequest = requestHost.equals(forumHost, ignoreCase = true)
+
+                // If this is an external request (e.g. direct to Cloudflare or Bunny), proceed normally
+                if (!isDiscourseRequest) {
+                    return@addInterceptor chain.proceed(original)
+                }
+
                 val requestBuilder = original.newBuilder()
                     .header(
                         "User-Agent",
-                        "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36 Discoursey/0.0.1"
+                        "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36 Discoursey/0.0.3"
                     )
                     .header("Accept", "application/json")
                     .header("X-Requested-With", "XMLHttpRequest")
@@ -140,9 +167,17 @@ class DiscourseClient(private val context: Context) {
                 requestBuilder.header("Referer", "$baseUri/")
                 requestBuilder.header("Origin", baseUri)
 
-                // Attach CSRF Token for state modifying requests
-                if (!csrfToken.isNullOrBlank() && original.method in listOf("POST", "PUT", "DELETE", "PATCH")) {
-                    requestBuilder.header("X-CSRF-Token", csrfToken!!)
+                val isModifying = original.method in listOf("POST", "PUT", "DELETE", "PATCH")
+
+                // Ensure CSRF token is present for modifying requests
+                if (isModifying) {
+                    var token = csrfToken
+                    if (token.isNullOrBlank() && !original.url.encodedPath.contains("session/csrf")) {
+                        token = fetchFreshCsrfSync()
+                    }
+                    if (!token.isNullOrBlank()) {
+                        requestBuilder.header("X-CSRF-Token", token)
+                    }
                 }
 
                 // If User API Key is configured
@@ -156,12 +191,54 @@ class DiscourseClient(private val context: Context) {
                     requestBuilder.header("Api-Username", adminUsername!!)
                 }
 
-                chain.proceed(requestBuilder.build())
+                val response = chain.proceed(requestBuilder.build())
+
+                // If 403 Forbidden on a modifying request, check if CSRF expired and retry once
+                if (response.code == 403 && isModifying && !original.url.encodedPath.contains("session")) {
+                    response.close()
+                    val freshToken = fetchFreshCsrfSync()
+                    if (!freshToken.isNullOrBlank()) {
+                        val retryRequest = requestBuilder
+                            .header("X-CSRF-Token", freshToken)
+                            .build()
+                        return@addInterceptor chain.proceed(retryRequest)
+                    }
+                }
+
+                response
             }
             .addInterceptor(HttpLoggingInterceptor().apply {
                 level = HttpLoggingInterceptor.Level.HEADERS
             })
             .build()
+    }
+
+    @Synchronized
+    fun fetchFreshCsrfSync(): String? {
+        return try {
+            val baseUri = currentBaseUrl.trimEnd('/')
+            val request = Request.Builder()
+                .url("$baseUri/session/csrf.json")
+                .header("User-Agent", "Mozilla/5.0 (Linux; Android 14; Mobile) Discoursey/0.0.3")
+                .header("Accept", "application/json")
+                .header("X-Requested-With", "XMLHttpRequest")
+                .header("Referer", "$baseUri/")
+                .build()
+
+            val response = rawHttpClient.newCall(request).execute()
+            if (response.isSuccessful) {
+                val body = response.body?.string() ?: return null
+                val json = Gson().fromJson(body, JsonObject::class.java)
+                val token = json.get("csrf")?.asString
+                if (!token.isNullOrBlank()) {
+                    csrfToken = token
+                    return token
+                }
+            }
+            null
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private var retrofit: Retrofit = buildRetrofit(currentBaseUrl)
@@ -180,7 +257,6 @@ class DiscourseClient(private val context: Context) {
         currentBaseUrl = normalized
 
         if (isApiKey && !key.isNullOrBlank()) {
-            // Check if 64-character user API key or admin key
             if (key.length == 64 && !username.isNullOrBlank()) {
                 userApiKey = key
                 adminApiKey = null
@@ -191,7 +267,6 @@ class DiscourseClient(private val context: Context) {
                 userApiKey = null
             }
         } else {
-            // Password based session authentication
             userApiKey = null
             adminApiKey = null
             adminUsername = null
@@ -209,6 +284,7 @@ class DiscourseClient(private val context: Context) {
         adminApiKey = null
         adminUsername = null
         cookieJar.clear()
+        sessionPrefs.edit().clear().apply()
     }
 
     private fun buildRetrofit(baseUrl: String): Retrofit {

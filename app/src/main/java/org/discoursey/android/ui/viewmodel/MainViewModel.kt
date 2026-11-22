@@ -194,6 +194,10 @@ class MainViewModel(
     }
 
     fun loadTopicDetail(topicId: Long) {
+        // Clear previous topic immediately to prevent flash of previous topic
+        if (_uiState.value.currentTopicDetail?.id != topicId) {
+            _uiState.value = _uiState.value.copy(currentTopicDetail = null, isLoading = true)
+        }
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(isLoading = true)
             try {
@@ -209,6 +213,10 @@ class MainViewModel(
                 )
             }
         }
+    }
+
+    fun clearTopicDetail() {
+        _uiState.value = _uiState.value.copy(currentTopicDetail = null)
     }
 
     fun createTopic(title: String, raw: String, categoryId: Long?, onDone: (Boolean) -> Unit) {
@@ -240,22 +248,151 @@ class MainViewModel(
     }
 
     fun toggleLike(postId: Long, currentLiked: Boolean) {
+        toggleReaction(postId, "heart")
+    }
+
+    fun toggleReaction(postId: Long, reactionName: String) {
         viewModelScope.launch {
-            repository.toggleLike(postId, currentLiked)
             val detail = _uiState.value.currentTopicDetail ?: return@launch
-            val updatedPosts = detail.postStream?.posts?.map { post ->
-                if (post.id == postId) {
-                    val newCount = if (currentLiked) maxOf(0, post.likeCount - 1) else post.likeCount + 1
-                    val newActions = post.actionsSummary.toMutableList()
-                    val idx = newActions.indexOfFirst { it.id == 2 }
-                    if (idx >= 0) {
-                        newActions[idx] = newActions[idx].copy(count = newCount, acted = !currentLiked)
+            val post = detail.postStream?.posts?.firstOrNull { it.id == postId } ?: return@launch
+
+            val isCurrentlyReactedWithThis = post.currentUserReaction?.id == reactionName || (reactionName == "heart" && post.isLiked && post.currentUserReaction == null)
+            val previousReactionId = post.currentUserReaction?.id ?: if (post.isLiked) "heart" else null
+
+            // Optimistic UI update
+            val updatedPosts = detail.postStream?.posts?.map { p ->
+                if (p.id == postId) {
+                    val reactionsList = p.reactions.map { it.copy() }.toMutableList()
+                    val actionsList = p.actionsSummary.map { it.copy() }.toMutableList()
+
+                    if (isCurrentlyReactedWithThis) {
+                        // User is removing this reaction
+                        val idx = reactionsList.indexOfFirst { it.id == reactionName }
+                        if (idx >= 0) {
+                            val newCount = reactionsList[idx].count - 1
+                            if (newCount <= 0) {
+                                reactionsList.removeAt(idx)
+                            } else {
+                                reactionsList[idx] = reactionsList[idx].copy(count = newCount)
+                            }
+                        }
+                        if (reactionName == "heart") {
+                            val likeIdx = actionsList.indexOfFirst { it.id == 2 }
+                            if (likeIdx >= 0) {
+                                actionsList[likeIdx] = actionsList[likeIdx].copy(count = maxOf(0, actionsList[likeIdx].count - 1), acted = false)
+                            }
+                        }
+                        p.copy(
+                            reactions = reactionsList,
+                            actionsSummary = actionsList,
+                            currentUserReaction = null
+                        )
                     } else {
-                        newActions.add(PostActionSummary(2, count = newCount, acted = !currentLiked))
+                        // User is switching from another reaction or adding a new one
+                        if (!previousReactionId.isNullOrBlank()) {
+                            val prevIdx = reactionsList.indexOfFirst { it.id == previousReactionId }
+                            if (prevIdx >= 0) {
+                                val prevCount = reactionsList[prevIdx].count - 1
+                                if (prevCount <= 0) {
+                                    reactionsList.removeAt(prevIdx)
+                                } else {
+                                    reactionsList[prevIdx] = reactionsList[prevIdx].copy(count = prevCount)
+                                }
+                            }
+                            if (previousReactionId == "heart") {
+                                val likeIdx = actionsList.indexOfFirst { it.id == 2 }
+                                if (likeIdx >= 0) {
+                                    actionsList[likeIdx] = actionsList[likeIdx].copy(count = maxOf(0, actionsList[likeIdx].count - 1), acted = false)
+                                }
+                            }
+                        }
+
+                        // Add new reaction
+                        val newIdx = reactionsList.indexOfFirst { it.id == reactionName }
+                        if (newIdx >= 0) {
+                            reactionsList[newIdx] = reactionsList[newIdx].copy(count = reactionsList[newIdx].count + 1)
+                        } else {
+                            reactionsList.add(PostReaction(id = reactionName, type = "emoji", count = 1))
+                        }
+                        if (reactionName == "heart") {
+                            val likeIdx = actionsList.indexOfFirst { it.id == 2 }
+                            if (likeIdx >= 0) {
+                                actionsList[likeIdx] = actionsList[likeIdx].copy(count = actionsList[likeIdx].count + 1, acted = true)
+                            } else {
+                                actionsList.add(PostActionSummary(id = 2, count = 1, acted = true))
+                            }
+                        }
+
+                        p.copy(
+                            reactions = reactionsList,
+                            actionsSummary = actionsList,
+                            currentUserReaction = PostCurrentUserReaction(id = reactionName)
+                        )
                     }
-                    post.copy(actionsSummary = newActions)
-                } else post
+                } else p
             } ?: emptyList()
+
+            _uiState.value = _uiState.value.copy(
+                currentTopicDetail = detail.copy(
+                    postStream = detail.postStream?.copy(posts = updatedPosts)
+                )
+            )
+
+            // Send to server
+            repository.toggleReaction(postId, reactionName)
+        }
+    }
+
+    fun votePoll(postId: Long, pollName: String, optionId: String) {
+        viewModelScope.launch {
+            val detail = _uiState.value.currentTopicDetail ?: return@launch
+            val post = detail.postStream?.posts?.firstOrNull { it.id == postId } ?: return@launch
+            val currentVotes = post.pollsVotes[pollName] ?: emptyList()
+            val alreadyVotedThisOption = currentVotes.contains(optionId)
+
+            val newVotesList = if (alreadyVotedThisOption) {
+                currentVotes - optionId
+            } else {
+                listOf(optionId)
+            }
+
+            if (newVotesList.isEmpty()) {
+                repository.unvotePoll(postId, pollName)
+            } else {
+                repository.votePoll(postId, pollName, newVotesList)
+            }
+
+            val updatedPosts = detail.postStream?.posts?.map { p ->
+                if (p.id == postId) {
+                    val updatedPolls = p.polls.map { poll ->
+                        if (poll.name == pollName) {
+                            val updatedOptions = poll.options.map { opt ->
+                                val delta = if (opt.id == optionId) {
+                                    if (alreadyVotedThisOption) -1 else 1
+                                } else if (!alreadyVotedThisOption && currentVotes.contains(opt.id)) {
+                                    -1
+                                } else 0
+                                opt.copy(votes = maxOf(0, opt.votes + delta))
+                            }
+                            val deltaVoters = if (alreadyVotedThisOption && newVotesList.isEmpty()) -1
+                                              else if (!alreadyVotedThisOption && currentVotes.isEmpty()) 1
+                                              else 0
+                            poll.copy(
+                                options = updatedOptions,
+                                voters = maxOf(0, poll.voters + deltaVoters)
+                            )
+                        } else poll
+                    }
+                    val updatedPollsVotes = p.pollsVotes.toMutableMap()
+                    if (newVotesList.isEmpty()) {
+                        updatedPollsVotes.remove(pollName)
+                    } else {
+                        updatedPollsVotes[pollName] = newVotesList
+                    }
+                    p.copy(polls = updatedPolls, pollsVotes = updatedPollsVotes)
+                } else p
+            } ?: emptyList()
+
             _uiState.value = _uiState.value.copy(
                 currentTopicDetail = detail.copy(
                     postStream = detail.postStream?.copy(posts = updatedPosts)
@@ -264,30 +401,30 @@ class MainViewModel(
         }
     }
 
-    fun toggleReaction(postId: Long, reactionName: String) {
+    fun toggleTopicVote(topicId: Long) {
         viewModelScope.launch {
-            repository.toggleReaction(postId, reactionName)
             val detail = _uiState.value.currentTopicDetail ?: return@launch
-            val updatedPosts = detail.postStream?.posts?.map { post ->
-                if (post.id == postId) {
-                    val reactionsList = post.reactions.toMutableList()
-                    val existing = reactionsList.indexOfFirst { it.id == reactionName }
-                    if (existing >= 0) {
-                        reactionsList[existing] = reactionsList[existing].copy(count = reactionsList[existing].count + 1)
-                    } else {
-                        reactionsList.add(PostReaction(id = reactionName, type = "emoji", count = 1))
-                    }
-                    post.copy(
-                        reactions = reactionsList,
-                        currentUserReaction = PostCurrentUserReaction(id = reactionName)
+            if (detail.id != topicId) return@launch
+            val isVoted = detail.userVoted == true
+            val currentCount = detail.voteCount ?: 0
+
+            if (isVoted) {
+                repository.unvoteTopic(topicId)
+                _uiState.value = _uiState.value.copy(
+                    currentTopicDetail = detail.copy(
+                        userVoted = false,
+                        voteCount = maxOf(0, currentCount - 1)
                     )
-                } else post
-            } ?: emptyList()
-            _uiState.value = _uiState.value.copy(
-                currentTopicDetail = detail.copy(
-                    postStream = detail.postStream?.copy(posts = updatedPosts)
                 )
-            )
+            } else {
+                repository.voteTopic(topicId)
+                _uiState.value = _uiState.value.copy(
+                    currentTopicDetail = detail.copy(
+                        userVoted = true,
+                        voteCount = currentCount + 1
+                    )
+                )
+            }
         }
     }
 
@@ -301,29 +438,26 @@ class MainViewModel(
             _uiState.value = _uiState.value.copy(isLoading = true)
 
             if (isVideo) {
-                // Try Discourse Video Stream plugin first
-                val fileName = "video_${System.currentTimeMillis()}.mp4"
-                val prepareResult = repository.prepareVideoStream(fileName, 1024L * 1024L, "video/mp4")
-                if (prepareResult.isSuccess && !prepareResult.getOrNull()?.videoId.isNullOrBlank()) {
-                    val videoId = prepareResult.getOrNull()!!.videoId!!
-                    _uiState.value = _uiState.value.copy(isLoading = false)
-                    onDone("\n[video-stream id=\"$videoId\"]\n", null)
-                    return@launch
+                val streamResult = repository.uploadVideoStream(context, uri)
+                _uiState.value = _uiState.value.copy(isLoading = false)
+                streamResult.onSuccess { bbcode ->
+                    onDone(bbcode, null)
+                }.onFailure { err ->
+                    onDone(null, err.localizedMessage ?: "Failed to upload video.")
                 }
+                return@launch
             }
 
-            // Standard upload
+            // Standard image upload without filenames
             val result = repository.uploadFile(context, uri)
             _uiState.value = _uiState.value.copy(isLoading = false)
             result.onSuccess { upload ->
-                val markdown = if (isVideo) {
-                    "\n![video](${upload.url})\n"
-                } else {
-                    "\n![${upload.originalFilename.ifBlank { "image" }}](${upload.url})\n"
-                }
+                val targetUrl = upload.shortUrl?.takeIf { it.isNotBlank() } ?: upload.url
+                // No file name in markdown tag
+                val markdown = "\n![]($targetUrl)\n"
                 onDone(markdown, null)
             }.onFailure { err ->
-                onDone(null, err.localizedMessage ?: "Failed to upload file.")
+                onDone(null, err.localizedMessage ?: "Failed to upload image.")
             }
         }
     }

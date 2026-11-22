@@ -111,7 +111,10 @@ data class TopicDetailResponse(
     @SerializedName("archived") val archived: Boolean = false,
     @SerializedName("category_id") val categoryId: Long? = null,
     @SerializedName("post_stream") val postStream: PostStream? = null,
-    @SerializedName("details") val details: TopicDetails? = null
+    @SerializedName("details") val details: TopicDetails? = null,
+    @SerializedName("can_vote") val canVote: Boolean? = null,
+    @SerializedName("vote_count") var voteCount: Int? = null,
+    @SerializedName("user_voted") var userVoted: Boolean? = null
 )
 
 data class PostStream(
@@ -163,7 +166,9 @@ data class Post(
     @SerializedName("actions_summary") val actionsSummary: List<PostActionSummary> = emptyList(),
     @SerializedName("bookmarked") var bookmarked: Boolean = false,
     @SerializedName("reactions") var reactions: List<PostReaction> = emptyList(),
-    @SerializedName("current_user_reaction") var currentUserReaction: PostCurrentUserReaction? = null
+    @SerializedName("current_user_reaction") var currentUserReaction: PostCurrentUserReaction? = null,
+    @SerializedName("polls") var polls: List<Poll> = emptyList(),
+    @SerializedName("polls_votes") var pollsVotes: Map<String, List<String>> = emptyMap()
 ) {
     fun getDisplayName(preference: String = "AUTO", forumAllowsNames: Boolean = true): String {
         return when (preference) {
@@ -212,6 +217,23 @@ data class PostReaction(
 data class PostCurrentUserReaction(
     @SerializedName("id") val id: String = "",
     @SerializedName("can_undo") val canUndo: Boolean = true
+)
+
+data class Poll(
+    @SerializedName("name") val name: String = "poll",
+    @SerializedName("type") val type: String = "regular",
+    @SerializedName("status") val status: String = "open",
+    @SerializedName("title") val title: String? = null,
+    @SerializedName("options") var options: List<PollOption> = emptyList(),
+    @SerializedName("voters") var voters: Int = 0,
+    @SerializedName("public") val public: Boolean = false,
+    @SerializedName("chart_type") val chartType: String = "bar"
+)
+
+data class PollOption(
+    @SerializedName("id") val id: String = "",
+    @SerializedName("html") val html: String = "",
+    @SerializedName("votes") var votes: Int = 0
 )
 
 data class PostActionSummary(
@@ -361,7 +383,9 @@ data class UploadResponse(
 data class PrepareVideoUploadResponse(
     @SerializedName("upload_url") val uploadUrl: String? = null,
     @SerializedName("video_id") val videoId: String? = null,
-    @SerializedName("stream_media_id") val streamMediaId: String? = null
+    @SerializedName("stream_media_id") val streamMediaId: String? = null,
+    @SerializedName("endpoint") val endpoint: String? = null,
+    @SerializedName("headers") val headers: Map<String, String> = emptyMap()
 )
 
 data class CreatePostRequest(
